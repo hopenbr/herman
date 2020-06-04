@@ -19,6 +19,8 @@ import com.amazonaws.ClientConfiguration;
 import com.amazonaws.auth.AWSCredentials;
 import com.amazonaws.auth.AWSStaticCredentialsProvider;
 import com.amazonaws.regions.Regions;
+import com.amazonaws.services.cloudwatchevents.AmazonCloudWatchEvents;
+import com.amazonaws.services.cloudwatchevents.AmazonCloudWatchEventsClientBuilder;
 import com.amazonaws.services.dynamodbv2.AmazonDynamoDB;
 import com.amazonaws.services.dynamodbv2.AmazonDynamoDBClientBuilder;
 import com.amazonaws.services.dynamodbv2.model.AttributeDefinition;
@@ -76,6 +78,7 @@ import com.fasterxml.jackson.dataformat.yaml.YAMLFactory;
 import com.libertymutualgroup.herman.aws.AwsExecException;
 import com.libertymutualgroup.herman.aws.credentials.BambooCredentialsHandler;
 import com.libertymutualgroup.herman.aws.ecs.PushType;
+import com.libertymutualgroup.herman.aws.ecs.broker.cloudwatch.CloudWatchEventsBroker;
 import com.libertymutualgroup.herman.aws.ecs.broker.dynamodb.DynamoDBBroker;
 import com.libertymutualgroup.herman.aws.ecs.broker.dynamodb.DynamoDBMixIns;
 import com.libertymutualgroup.herman.aws.ecs.broker.iam.IAMBroker;
@@ -134,6 +137,7 @@ public class LambdaBroker {
     private AmazonSQS sqsClient;
     private AmazonSNS snsClient;
     private AmazonDynamoDB dynamoDbClient;
+    private AmazonCloudWatchEvents cloudWatchEventsClient;
 
     private ObjectMapper mapper = new ObjectMapper();
 
@@ -195,6 +199,12 @@ public class LambdaBroker {
             .withClientConfiguration(config)
             .withRegion(region)
             .build();
+
+        this.cloudWatchEventsClient = AmazonCloudWatchEventsClientBuilder.standard()
+            .withCredentials(new AWSStaticCredentialsProvider(context.getSessionCredentials()))
+            .withClientConfiguration(config)
+            .withRegion(region)
+            .build();
     }
 
     public void brokerLambda() throws IOException {
@@ -235,7 +245,7 @@ public class LambdaBroker {
         IAMBroker iamBroker = new IAMBroker(this.buildLogger);
         Role executionRole = iamBroker
             .brokerAppRole(this.iamClient, this.configuration, policy, this.context.getBambooPropertyHandler(),
-                PushType.LAMBDA);
+                PushType.LAMBDA, this.configuration.getTags());
         this.context.getBambooPropertyHandler().addProperty("app.iam", executionRole.getArn());
 
         FunctionCode functionCode;
@@ -354,6 +364,7 @@ public class LambdaBroker {
         brokerSqs(this.configuration);
         brokerKinesisStream(this.configuration);
         brokerDynamoDB(this.configuration);
+        brokerScheduledRule(this.configuration, output);
     }
 
     private Environment getEnvironment() {
@@ -572,5 +583,10 @@ public class LambdaBroker {
             this.buildLogger.addLogEntry("Brokering DynamoDB tables");
             dynamoDBBroker.createDynamoDBTables(dynamoDbClient);
         }
+    }
+
+    private void brokerScheduledRule(LambdaInjectConfiguration configuration, GetFunctionResult output) {
+        CloudWatchEventsBroker cloudWatchEventsBroker = new CloudWatchEventsBroker(this.buildLogger, this.cloudWatchEventsClient);
+        cloudWatchEventsBroker.brokerScheduledRule(configuration, output);
     }
 }

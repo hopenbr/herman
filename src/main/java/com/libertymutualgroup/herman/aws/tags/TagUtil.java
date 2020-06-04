@@ -48,6 +48,22 @@ public class TagUtil {
         return tags.stream().map(HermanTag::toDynamoTag).collect(Collectors.toList());
     }
 
+    public static List<com.amazonaws.services.ecs.model.Tag> hermanToEcsTags(List<HermanTag> tags) {
+        return tags.stream().map(HermanTag::toEcsTag).collect(Collectors.toList());
+    }
+
+    public static List<com.amazonaws.services.cloudformation.model.Tag> hermanToCftTags(List<HermanTag> tags) {
+        return tags.stream().map(HermanTag::toCftTag).collect(Collectors.toList());
+    }
+
+    public static List<com.amazonaws.services.identitymanagement.model.Tag> hermanToIamTags(List<HermanTag> tags) {
+        return tags.stream().map(HermanTag::toIamTag).collect(Collectors.toList());
+    }
+
+    public static List<com.amazonaws.services.cloudwatchevents.model.Tag> hermanToCloudWatchEventsTags(List<HermanTag> tags) {
+        return tags.stream().map(HermanTag::toCloudWatchEventsTag).collect(Collectors.toList());
+    }
+
     public static Map<String, String> hermanToMap(List<HermanTag> tags) {
         return tags.stream().collect(Collectors.toMap(HermanTag::getKey, HermanTag::getValue));
     }

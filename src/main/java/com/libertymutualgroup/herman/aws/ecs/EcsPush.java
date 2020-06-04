@@ -37,6 +37,7 @@ import com.amazonaws.services.ecs.model.Container;
 import com.amazonaws.services.ecs.model.ContainerDefinition;
 import com.amazonaws.services.ecs.model.CreateServiceRequest;
 import com.amazonaws.services.ecs.model.CreateServiceResult;
+import com.amazonaws.services.ecs.model.DeleteServiceRequest;
 import com.amazonaws.services.ecs.model.DeregisterTaskDefinitionRequest;
 import com.amazonaws.services.ecs.model.DescribeServicesRequest;
 import com.amazonaws.services.ecs.model.DescribeServicesResult;
@@ -51,6 +52,7 @@ import com.amazonaws.services.ecs.model.RegisterTaskDefinitionRequest;
 import com.amazonaws.services.ecs.model.RegisterTaskDefinitionResult;
 import com.amazonaws.services.ecs.model.RunTaskRequest;
 import com.amazonaws.services.ecs.model.RunTaskResult;
+import com.amazonaws.services.ecs.model.SchedulingStrategy;
 import com.amazonaws.services.ecs.model.Service;
 import com.amazonaws.services.ecs.model.ServiceEvent;
 import com.amazonaws.services.ecs.model.StopTaskRequest;
@@ -67,14 +69,13 @@ import com.amazonaws.services.kinesis.AmazonKinesisClientBuilder;
 import com.amazonaws.services.kms.AWSKMS;
 import com.amazonaws.services.kms.AWSKMSClientBuilder;
 import com.amazonaws.services.lambda.AWSLambda;
+import com.amazonaws.services.lambda.AWSLambdaAsync;
+import com.amazonaws.services.lambda.AWSLambdaAsyncClientBuilder;
 import com.amazonaws.services.lambda.AWSLambdaClientBuilder;
 import com.amazonaws.services.rds.AmazonRDS;
 import com.amazonaws.services.rds.AmazonRDSClientBuilder;
 import com.amazonaws.services.s3.AmazonS3;
 import com.amazonaws.services.s3.AmazonS3ClientBuilder;
-import com.amazonaws.services.securitytoken.AWSSecurityTokenService;
-import com.amazonaws.services.securitytoken.AWSSecurityTokenServiceClientBuilder;
-import com.amazonaws.services.securitytoken.model.GetCallerIdentityRequest;
 import com.amazonaws.services.sns.AmazonSNS;
 import com.amazonaws.services.sns.AmazonSNSClientBuilder;
 import com.amazonaws.services.sqs.AmazonSQS;
@@ -82,6 +83,9 @@ import com.amazonaws.services.sqs.AmazonSQSClientBuilder;
 import com.amazonaws.util.IOUtils;
 import com.libertymutualgroup.herman.aws.AwsExecException;
 import com.libertymutualgroup.herman.aws.ecs.broker.autoscaling.AutoscalingBroker;
+import com.libertymutualgroup.herman.aws.ecs.broker.custom.CustomBroker;
+import com.libertymutualgroup.herman.aws.ecs.broker.custom.CustomBrokerConfiguration;
+import com.libertymutualgroup.herman.aws.ecs.broker.custom.CustomBrokerPhase;
 import com.libertymutualgroup.herman.aws.ecs.broker.dynamodb.DynamoDBBroker;
 import com.libertymutualgroup.herman.aws.ecs.broker.iam.IAMBroker;
 import com.libertymutualgroup.herman.aws.ecs.broker.kinesis.KinesisBroker;
@@ -112,7 +116,6 @@ import com.libertymutualgroup.herman.aws.tags.HermanTag;
 import com.libertymutualgroup.herman.aws.tags.TagUtil;
 import com.libertymutualgroup.herman.logging.HermanLogger;
 import com.libertymutualgroup.herman.task.ecs.ECSPushTaskProperties;
-import com.libertymutualgroup.herman.util.ArnUtil;
 import com.libertymutualgroup.herman.util.FileUtil;
 import org.apache.logging.log4j.util.Strings;
 
@@ -122,6 +125,7 @@ import java.util.ArrayList;
 import java.util.Date;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Map.Entry;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
@@ -152,6 +156,7 @@ public class EcsPush {
     private AmazonSNS snsClient;
     private AmazonDynamoDB dynamoDbClient;
     private AWSLambda lambdaClient;
+    private AWSLambdaAsync lambdaAsyncClient;
     private AmazonCloudWatch cloudWatchClient;
     private FileUtil fileUtil;
 
@@ -219,6 +224,12 @@ public class EcsPush {
         this.lambdaClient = AWSLambdaClientBuilder.standard()
             .withCredentials(new AWSStaticCredentialsProvider(context.getSessionCredentials()))
             .withClientConfiguration(new ClientConfiguration().withClientExecutionTimeout(300000).withSocketTimeout(300000))
+            .withRegion(context.getRegion())
+            .build();
+
+        this.lambdaAsyncClient = AWSLambdaAsyncClientBuilder.standard()
+            .withCredentials(new AWSStaticCredentialsProvider(context.getSessionCredentials()))
+            .withClientConfiguration(new ClientConfiguration().withClientExecutionTimeout(900000).withSocketTimeout(900000))
             .withRegion(context.getRegion())
             .build();
 
@@ -482,12 +493,18 @@ public class EcsPush {
         if (!serviceExists) {
             logger.addLogEntry("NEW SERVICE");
             CreateServiceRequest cr = new CreateServiceRequest().withCluster(clusterMetadata.getClusterId())
-                .withDesiredCount(definition.getService().getInstanceCount()).withRole(serviceRole)
-                .withTaskDefinition(taskDefinition.getTaskDefinitionArn()).withServiceName(appName)
+                .withRole(serviceRole)
+                .withTaskDefinition(taskDefinition.getTaskDefinitionArn())
+                .withServiceName(appName)
                 .withDeploymentConfiguration(definition.getService().getDeploymentConfiguration())
                 .withClientToken(UUID.randomUUID().toString())
+                .withSchedulingStrategy(definition.getService().getSchedulingStrategy())
                 .withPlacementConstraints(definition.getService().getPlacementConstraints())
                 .withPlacementStrategy(definition.getService().getPlacementStrategies());
+
+            if (!definition.getService().getSchedulingStrategy().equals(SchedulingStrategy.DAEMON)) {
+                cr.withDesiredCount(definition.getService().getInstanceCount());
+            }
 
             if (balancer != null) {
                 logger.addLogEntry("Adding load balancer to service");
@@ -505,10 +522,13 @@ public class EcsPush {
         } else {
             logger.addLogEntry("UPDATE SERVICE");
             UpdateServiceRequest updateRequest = new UpdateServiceRequest().withCluster(clusterMetadata.getClusterId())
-                .withDesiredCount(definition.getService().getInstanceCount())
                 .withDeploymentConfiguration(definition.getService().getDeploymentConfiguration())
                 .withTaskDefinition(taskDefinition.getTaskDefinitionArn())
                 .withService(appName);
+
+            if (!definition.getService().getSchedulingStrategy().equals(SchedulingStrategy.DAEMON)) {
+                updateRequest.withDesiredCount(definition.getService().getInstanceCount());
+            }
 
             if (balancer != null) {
                 updateRequest
@@ -520,7 +540,7 @@ public class EcsPush {
             ecsClient.updateService(updateRequest);
         }
 
-        waitForRequestInitialization(appName, ecsClient, clusterMetadata);
+        waitForRequestInitialization(definition, ecsClient, clusterMetadata);
         boolean deploySuccessful = waitForDeployment(appName, ecsClient, clusterMetadata);
 
         if (!deploySuccessful) {
@@ -543,11 +563,11 @@ public class EcsPush {
 
                 ecsClient.updateService(updateRequest);
 
-                waitForRequestInitialization(appName, ecsClient, clusterMetadata);
+                waitForRequestInitialization(definition, ecsClient, clusterMetadata);
                 boolean rollbackSuccessful = waitForDeployment(appName, ecsClient, clusterMetadata);
 
                 if (!rollbackSuccessful) {
-                    setUnsuccessfulServiceToZero(appName, ecsClient, clusterMetadata);
+                    setUnsuccessfulServiceToZero(definition, ecsClient, clusterMetadata);
                     throw new AwsExecException(
                         "Rollback never stabilized. Shutting down to stop flapping, we tried...");
                 } else {
@@ -555,7 +575,7 @@ public class EcsPush {
                         "Application rolled back successfully. Marking Bamboo as failed for notice.");
                 }
             } else {
-                setUnsuccessfulServiceToZero(appName, ecsClient, clusterMetadata);
+                setUnsuccessfulServiceToZero(definition, ecsClient, clusterMetadata);
                 throw new AwsExecException(
                     "Deployment never stabilized, no prior version. Shutting down to stop flapping, all we can do.");
             }
@@ -583,12 +603,15 @@ public class EcsPush {
                 lastEventId = lastEvent.getId();
             }
 
+
+
             ServiceEvent latest = service.getEvents().get(0);
             if (Objects.equals(service.getDesiredCount(), service.getRunningCount())
                 && latest.getMessage().contains("has reached a steady state")) {
                 logger.addLogEntry("App has stabilized");
                 return true;
             }
+
             try {
                 Thread.sleep(POLLING_INTERVAL_MS);
             } catch (InterruptedException e) {
@@ -597,16 +620,33 @@ public class EcsPush {
             }
             timeoutCount--;
         }
-        return false;
+        // Run one last check to see if minimum healthy percent was achieved
+        DescribeServicesResult servicesResult = ecsClient.describeServices(
+            new DescribeServicesRequest().withCluster(clusterMetadata.getClusterId()).withServices(appName));
+        Service service = servicesResult.getServices().get(0);
+        float healthyPercent = ((float) service.getRunningCount() / service.getDesiredCount()) * 100;
+        if (Objects.nonNull(service.getDeploymentConfiguration().getMinimumHealthyPercent()) && healthyPercent > service.getDeploymentConfiguration().getMinimumHealthyPercent()) {
+            logger.addLogEntry("Minimum healthy percent satisfied");
+            return true;
+        }
+
+        return false; // Didn't make minimum healthy percent, mark as failed
     }
 
-    private void setUnsuccessfulServiceToZero(String appName, AmazonECS ecsClient, EcsClusterMetadata clusterMetadata) {
-        logger.addLogEntry("Deployment was not successful - setting instance count to 0");
-        ecsClient.updateService(new UpdateServiceRequest().withCluster(clusterMetadata.getClusterId())
-            .withDesiredCount(0).withService(appName));
+    private void setUnsuccessfulServiceToZero(EcsPushDefinition definition, AmazonECS ecsClient, EcsClusterMetadata clusterMetadata) {
+        if (definition.getService().getSchedulingStrategy().equals(SchedulingStrategy.DAEMON)) {
+            logger.addLogEntry("Deployment was not successful - Deleting daemon service");
+            ecsClient.deleteService(new DeleteServiceRequest().withCluster(clusterMetadata.getClusterId())
+                .withService(definition.getAppName()));
+        }
+        else {
+            logger.addLogEntry("Deployment was not successful - setting instance count to 0");
+            ecsClient.updateService(new UpdateServiceRequest().withCluster(clusterMetadata.getClusterId())
+                .withDesiredCount(0).withService(definition.getAppName()));
+        }
     }
 
-    private void waitForRequestInitialization(String appName, AmazonECS ecsClient, EcsClusterMetadata clusterMetadata) {
+    private void waitForRequestInitialization(EcsPushDefinition definition, AmazonECS ecsClient, EcsClusterMetadata clusterMetadata) {
         int timeoutCount = this.pushContext.getTimeout() * 6;
 
         while (timeoutCount > 0) {
@@ -617,7 +657,7 @@ public class EcsPush {
                 throw new AwsExecException(INTERRUPTED_WHILE_POLLING);
             }
             DescribeServicesResult servicesResult = ecsClient.describeServices(
-                new DescribeServicesRequest().withCluster(clusterMetadata.getClusterId()).withServices(appName));
+                new DescribeServicesRequest().withCluster(clusterMetadata.getClusterId()).withServices(definition.getAppName()));
             Service service = servicesResult.getServices().get(0);
             if (service != null && !service.getEvents().isEmpty()) {
                 ServiceEvent lastEvent = service.getEvents().get(0);
@@ -632,7 +672,7 @@ public class EcsPush {
             }
             timeoutCount--;
         }
-        setUnsuccessfulServiceToZero(appName, ecsClient, clusterMetadata);
+        setUnsuccessfulServiceToZero(definition, ecsClient, clusterMetadata);
         throw new AwsExecException("AWS never initiated the deployment");
     }
 
@@ -702,12 +742,13 @@ public class EcsPush {
         EcsClusterMetadata clusterMetadata) {
 
         String applicationKeyId = brokerKms(definition, clusterMetadata);
-        brokerS3(definition, clusterMetadata, applicationKeyId);
-        brokerKinesisStream(definition);
         brokerSqs(definition);
         brokerSns(definition);
+        brokerS3(definition, clusterMetadata, applicationKeyId);
+        brokerKinesisStream(definition);
         brokerRds(definition, injectMagic, clusterMetadata, applicationKeyId);
         brokerDynamoDB(definition);
+        brokerCustom(definition, pushContext, clusterMetadata, lambdaAsyncClient, CustomBrokerPhase.PREPUSH);
     }
 
 
@@ -797,9 +838,6 @@ public class EcsPush {
     private void brokerKinesisStream(EcsPushDefinition definition) {
         KinesisBroker kinesisBroker = new KinesisBroker(logger, kinesisClient, definition, taskProperties);
 
-        // delete any streams tied to this app that are no longer specified in the PushDefinition
-        kinesisBroker.checkStreamsToBeDeleted();
-
         if (definition.getStreams() != null) {
             for (KinesisStream stream : definition.getStreams()) {
                 kinesisBroker.brokerStream(stream);
@@ -815,8 +853,8 @@ public class EcsPush {
         }
     }
 
-    private void brokerServicesPostPush(EcsPushDefinition definition, EcsClusterMetadata meta) {
-        if (taskProperties.getNewRelic() != null) {
+    private void brokerServicesPostPush(EcsPushDefinition definition, EcsClusterMetadata clusterMetadata) {
+        if (taskProperties.getNewRelic() != null && definition.getNewRelicApplicationName() != null) {
             NewRelicBrokerConfiguration newRelicBrokerConfiguration = new NewRelicBrokerConfiguration()
                 .withBrokerProperties(taskProperties.getNewRelic());
             NewRelicBroker newRelicBroker = new NewRelicBroker(
@@ -829,13 +867,15 @@ public class EcsPush {
                 definition.getNewRelic(),
                 definition.getAppName(),
                 definition.getNewRelicApplicationName(),
-                meta.getNewrelicLicenseKey());
+                clusterMetadata.getNewrelicLicenseKey());
         }
 
         if (definition.getBetaAutoscale() != null) {
             AutoscalingBroker asb = new AutoscalingBroker(pushContext);
-            asb.broker(meta, definition);
+            asb.broker(clusterMetadata, definition);
         }
+
+        brokerCustom(definition, pushContext, clusterMetadata, lambdaAsyncClient, CustomBrokerPhase.POSTPUSH);
     }
 
     private void logInvocationInCloudWatch(EcsPushDefinition definition) {
@@ -881,6 +921,32 @@ public class EcsPush {
             cloudWatchClient.putMetricData(new PutMetricDataRequest().withNamespace("Herman/Deploy").withMetricData(d));
         } catch (Exception e) { // NOSONAR
             pushContext.getLogger().addLogEntry("Error logging result to CW: " + e.getMessage());// nothing to do
+        }
+    }
+
+    private void brokerCustom(
+        EcsPushDefinition definition,
+        EcsPushContext pushContext,
+        EcsClusterMetadata clusterMetadata,
+        AWSLambdaAsync lambdaAsyncClient,
+        CustomBrokerPhase phase
+    ) {
+        if(definition != null && definition.getCustomBrokers() != null){
+            for(Entry<String, Object> entry: definition.getCustomBrokers().entrySet()){
+                CustomBrokerConfiguration config = pushContext.getTaskProperties().getCustomBrokers().get(entry.getKey());
+                if(config.getPhase() == phase){
+                    CustomBroker customBroker = new CustomBroker(
+                        entry.getKey(),
+                        entry.getValue(),
+                        pushContext,
+                        definition,
+                        clusterMetadata,
+                        config,
+                        lambdaAsyncClient
+                    );
+                    customBroker.runBroker();
+                }
+            }
         }
     }
 }
